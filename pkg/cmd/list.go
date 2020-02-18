@@ -4,23 +4,30 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"text/tabwriter"
+	"time"
+
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"io"
 	core "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clioptions "k8s.io/cli-runtime/pkg/genericclioptions"
+	diskcached "k8s.io/client-go/discovery/cached/disk"
 	"k8s.io/client-go/kubernetes"
 	clientcore "k8s.io/client-go/kubernetes/typed/core/v1"
 	clientrbac "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
-	"strings"
-	"text/tabwriter"
+	"k8s.io/client-go/util/homedir"
 )
 
 const (
@@ -103,8 +110,33 @@ type WhoCan struct {
 	policyRuleMatcher  PolicyRuleMatcher
 }
 
-// NewWhoCan constructs a new WhoCan checker with the specified rest.Config and RESTMapper.
-func NewWhoCan(restConfig *rest.Config, mapper apimeta.RESTMapper) (*WhoCan, error) {
+// overlyCautiousIllegalFileCharacters matches characters that *might* not be supported.  Windows is really restrictive, so this is really restrictive
+var overlyCautiousIllegalFileCharacters = regexp.MustCompile(`[^(\w/\.)]`)
+
+// computeDiscoverCacheDir takes the parentDir and the host and comes up with a "usually non-colliding" name.
+func computeDiscoverCacheDir(parentDir, host string) string {
+	// strip the optional scheme from host if its there:
+	schemelessHost := strings.Replace(strings.Replace(host, "https://", "", 1), "http://", "", 1)
+	// now do a simple collapse of non-AZ09 characters.  Collisions are possible but unlikely.  Even if we do collide the problem is short lived
+	safeHost := overlyCautiousIllegalFileCharacters.ReplaceAllString(schemelessHost, "_")
+	return filepath.Join(parentDir, safeHost)
+}
+
+// NewWhoCan constructs a new WhoCan checker with the specified rest.Config and creates a default RESTMapper.
+func NewWhoCan(restConfig *rest.Config) (*WhoCan, error) {
+	discoveryCacheDir := computeDiscoverCacheDir(filepath.Join(homedir.HomeDir(), ".kube", "cache", "discovery"), restConfig.Host)
+	discoveryClient, err := diskcached.NewCachedDiscoveryClientForConfig(restConfig, discoveryCacheDir, "", time.Duration(10*time.Minute))
+	if err != nil {
+		return nil, fmt.Errorf("creating discovery client: %v", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
+	expander := restmapper.NewShortcutExpander(mapper, discoveryClient)
+
+	return NewWhoCanWithRESTMapper(restConfig, expander)
+}
+
+// NewWhoCanWithRESTMapper constructs a new WhoCan checker with the specified rest.Config and RESTMapper.
+func NewWhoCanWithRESTMapper(restConfig *rest.Config, mapper apimeta.RESTMapper) (*WhoCan, error) {
 	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return nil, err
@@ -148,7 +180,7 @@ func NewWhoCanCommand(streams clioptions.IOStreams) (*cobra.Command, error) {
 				return err
 			}
 
-			o, err := NewWhoCan(restConfig, mapper)
+			o, err := NewWhoCanWithRESTMapper(restConfig, mapper)
 			if err != nil {
 				return err
 			}
